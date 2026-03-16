@@ -19,6 +19,7 @@ import {
 
 interface Env {
   DB: D1Database;
+  GITHUB_TOKEN?: string;
 }
 
 // ─── Admin ───────────────────────────────────────────────────────────────────
@@ -94,6 +95,8 @@ const MAX_DESCRIPTION = 2000;
 const MAX_TAGS = 500;
 const MAX_MESSAGE = 1000;
 const MAX_PROOF_URL = 500;
+const MAX_GITHUB_URL = 500;
+const GITHUB_ISSUE_URL_RE = /^https:\/\/github\.com\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+\/issues\/\d+$/;
 const MAX_REVIEWER_NOTES = 1000;
 
 const MAX_BODY_SIZE = 1024 * 1024; // 1MB
@@ -1538,6 +1541,11 @@ async function handleCreateBounty(body: any, db: D1Database, corsOrigin: string)
       return json({ error: 'deadline must be a future ISO 8601 date' }, 400, corsOrigin);
     }
   }
+  if (body.github_url) {
+    if (typeof body.github_url !== 'string' || body.github_url.length > MAX_GITHUB_URL || !GITHUB_ISSUE_URL_RE.test(body.github_url)) {
+      return json({ error: 'github_url must be a valid GitHub issue URL (https://github.com/owner/repo/issues/N)' }, 400, corsOrigin);
+    }
+  }
 
   // Ensure agent row exists
   await ensureAgent(db, auth.stxAddress, auth.btcAddress, aibtcAgent.display_name ?? undefined, aibtcAgent.level);
@@ -1546,10 +1554,10 @@ async function handleCreateBounty(body: any, db: D1Database, corsOrigin: string)
   const bountyUuid = crypto.randomUUID();
   const result = await dbRun(db
     .prepare(
-      `INSERT INTO bounties (uuid, creator_stx, title, description, amount_sats, tags, deadline)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO bounties (uuid, creator_stx, title, description, amount_sats, tags, deadline, github_url)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .bind(bountyUuid, auth.stxAddress, body.title, body.description, body.amount_sats, body.tags || null, body.deadline || null)
+    .bind(bountyUuid, auth.stxAddress, body.title, body.description, body.amount_sats, body.tags || null, body.deadline || null, body.github_url || null)
   );
 
   // Update agent stats
@@ -1974,6 +1982,50 @@ async function handleScheduled(env: Env): Promise<void> {
     } catch (err: any) {
       console.error(`Payment verification failed for ${payment.tx_hash}: ${err.message}`);
     }
+  }
+
+  // Auto-cancel bounties when linked GitHub issues close
+  try {
+    const linkedBounties = await db
+      .prepare("SELECT id, uuid, github_url FROM bounties WHERE status = 'open' AND github_url IS NOT NULL LIMIT 20")
+      .all<{ id: number; uuid: string; github_url: string }>();
+
+    for (const bounty of linkedBounties.results) {
+      try {
+        // Extract owner/repo/issue from github_url
+        const match = bounty.github_url.match(/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/);
+        if (!match) continue;
+        const [, owner, repo, issueNum] = match;
+
+        const ghHeaders: Record<string, string> = { 'User-Agent': 'agent-bounties-stale-sync/1.0' };
+        // Use GITHUB_TOKEN if available in env
+        if ((env as any).GITHUB_TOKEN) {
+          ghHeaders['Authorization'] = `Bearer ${(env as any).GITHUB_TOKEN}`;
+        }
+
+        const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/issues/${issueNum}`, {
+          headers: ghHeaders,
+        });
+
+        if (!resp.ok) {
+          console.warn(`GitHub API error for ${bounty.github_url}: ${resp.status}`);
+          continue;
+        }
+
+        const issue = await resp.json() as { state: string };
+        if (issue.state === 'closed') {
+          await dbRun(db
+            .prepare("UPDATE bounties SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?")
+            .bind(bounty.id)
+          );
+          console.log(`Auto-cancelled bounty ${bounty.uuid} (linked issue closed: ${bounty.github_url})`);
+        }
+      } catch (err: any) {
+        console.error(`Stale sync error for bounty ${bounty.uuid}: ${err.message}`);
+      }
+    }
+  } catch (err: any) {
+    console.error(`Stale sync query failed: ${err.message}`);
   }
 }
 
